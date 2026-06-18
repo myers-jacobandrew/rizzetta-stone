@@ -1,8 +1,13 @@
-# brainrot translator bot
+# Rizzetta Stone
 
-Discord bot that drops an Urban Dictionary card whenever someone uses
-gen z / gen alpha slang — and **teaches itself new slang** as the vernacular
-shifts, so you never have to maintain the word list. Born from "im not geomaxxing".
+A Discord bot by [@myers-jacobandrew](https://github.com/myers-jacobandrew).
+
+Auto-detects gen z / gen alpha slang in chat and replies with an Urban
+Dictionary card. It **teaches itself new slang** as terms trend — confirming
+them against Urban Dictionary before adding them — so the word list stays
+current with zero upkeep. Use `/define` to look up any word yourself.
+
+Born from "im not geomaxxing".
 
 ## How detection works
 
@@ -31,8 +36,9 @@ keep it from "learning" normal words.
 
 ## Slash commands (optional — auto-learn handles the rest)
 
-- `/define <word>` — anyone, look up any word
-- `/slang list` — show top tracked terms
+- `/define <word>` — anyone, look up any word on Urban Dictionary
+- `/slang list` — show the top tracked terms
+- `/slang pending` — show words climbing toward auto-learn (with their hit counts)
 - `/slang add <word>` / `/slang remove <word>` — mods (Manage Server) only
 
 ## Setup
@@ -56,6 +62,7 @@ keep it from "learning" normal words.
 | `SLANG_COOLDOWN` | 20 | seconds between cards per channel |
 | `LEARN_HITS` | 3 | sightings before the bot checks UD for a new word |
 | `LEARN_MIN_NET` | 150 | min UD net votes to auto-learn a word |
+| `LEARN_MIN_RATIO` | 0 | optional up/(up+down) floor (0 = off); blocks downvote-heavy words |
 | `SLANG_DB` | ./slang.db | DB file path |
 
 The `slang.db` file is the bot's memory — back it up / mount it on a volume if
