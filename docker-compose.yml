@@ -1,0 +1,21 @@
+services:
+  rizzetta-stone:
+    build: .
+    container_name: rizzetta-stone
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SLANG_DB: /data/slang.db
+    volumes:
+      # Persists the self-learned word DB across rebuilds/redeploys.
+      - slang-data:/data
+    # No ports: the bot only makes an outbound Gateway websocket connection.
+    # Cap log growth so a chatty bot can't fill the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  slang-data:

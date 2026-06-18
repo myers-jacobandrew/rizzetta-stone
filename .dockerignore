@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+slang.db
+.env
+.git/
+README.md
