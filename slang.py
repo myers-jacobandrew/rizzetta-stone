@@ -30,6 +30,34 @@ SUFFIXES = (
 
 _TOKEN_RE = re.compile(r"[a-zA-Z][a-zA-Z'\-]*[a-zA-Z]|[a-zA-Z]")
 
+# Context guards — many slang terms double as ordinary English. A hit is
+# suppressed when the surrounding word shows literal use (e.g. "based off of",
+# "fire department", "lit up"). Keyed by term (lowercase); values are the words
+# that, when they sit immediately after / before the term, mean "not slang".
+# Conservative on purpose — easy to extend as false positives turn up.
+LITERAL_NEXT = {
+    "based": {"off", "on", "in", "upon", "out", "around", "near", "at"},
+    "cap": {"of"},
+    "cope": {"with"},
+    "drip": {"of"},
+    "fire": {"alarm", "department", "truck", "wood", "works", "fighter",
+             "fighters", "place", "pit", "extinguisher", "hydrant"},
+    "goat": {"cheese", "milk", "farm", "meat"},
+    "lit": {"up"},
+    "mid": {"section", "day", "week", "night", "term", "field", "range",
+            "point", "west", "east", "level", "size", "century", "morning"},
+    "ratio": {"of"},
+    "cooked": {"the", "a", "dinner", "breakfast", "lunch", "meal", "food",
+               "rice", "chicken", "eggs", "pasta"},
+}
+LITERAL_PREV = {
+    "based": {"is", "was", "are", "be", "been", "being", "company", "team"},
+    "cap": {"bottle", "knee", "ball", "the", "a", "kneecap"},
+    "fire": {"a", "the", "camp", "cease", "open", "wild", "gun", "rapid"},
+    "goat": {"a", "the", "mountain", "pet", "billy"},
+    "ohio": {"in", "from", "to", "near", "of", "leaving", "visit", "visiting"},
+}
+
 # Common English — auto-learn skips these so the bot never "learns" the/and/lol.
 # Doesn't need to be exhaustive; it just kills the obvious false positives. The
 # Urban Dictionary vote threshold (bot.py) does the rest of the filtering.
@@ -67,11 +95,26 @@ def _is_hit(low: str, known: set) -> bool:
     return any(low.endswith(suf) and len(low) > len(suf) for suf in SUFFIXES)
 
 
+def _literal_use(low: str, prev: str, nxt: str) -> bool:
+    """True if the term is being used in plain English, not as slang."""
+    return nxt in LITERAL_NEXT.get(low, ()) or prev in LITERAL_PREV.get(low, ())
+
+
 def find_slang(text: str, known: set):
-    """First active-or-suffix slang term in text (original case), else None."""
-    for raw in _TOKEN_RE.findall(text):
-        if _is_hit(raw.lower(), known):
-            return raw
+    """First active-or-suffix slang term in text (original case), else None.
+
+    Skips hits that look like ordinary English given the neighbouring words
+    (e.g. "based off of ..." -> not the slang "based")."""
+    toks = _TOKEN_RE.findall(text)
+    for i, raw in enumerate(toks):
+        low = raw.lower()
+        if not _is_hit(low, known):
+            continue
+        prev = toks[i - 1].lower() if i > 0 else ""
+        nxt = toks[i + 1].lower() if i + 1 < len(toks) else ""
+        if _literal_use(low, prev, nxt):
+            continue
+        return raw
     return None
 
 

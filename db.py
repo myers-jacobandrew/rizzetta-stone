@@ -27,18 +27,38 @@ def init_db(seed_words=None):
     with _conn() as c:
         c.execute(
             """CREATE TABLE IF NOT EXISTS terms (
-                   term      TEXT PRIMARY KEY,
-                   source    TEXT NOT NULL,           -- seed | learned | manual
-                   added_at  TEXT NOT NULL,
-                   hits      INTEGER NOT NULL DEFAULT 0
+                   term       TEXT PRIMARY KEY,
+                   source     TEXT NOT NULL,           -- seed | learned | manual
+                   added_at   TEXT NOT NULL,
+                   hits       INTEGER NOT NULL DEFAULT 0,
+                   last_fired TEXT                      -- when a card last fired for this term
                )"""
         )
+        # Migrate older DBs that predate the last_fired column.
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(terms)")}
+        if "last_fired" not in cols:
+            c.execute("ALTER TABLE terms ADD COLUMN last_fired TEXT")
         c.execute(
             """CREATE TABLE IF NOT EXISTS candidates (
                    term       TEXT PRIMARY KEY,
                    count      INTEGER NOT NULL DEFAULT 0,
                    first_seen TEXT NOT NULL,
                    last_seen  TEXT NOT NULL
+               )"""
+        )
+        # Auto-translation on/off, tracked independently per guild and per
+        # channel. A missing row means "on". Auto fires only when BOTH the
+        # guild and the channel are enabled.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS guild_settings (
+                   guild_id     INTEGER PRIMARY KEY,
+                   auto_enabled INTEGER NOT NULL DEFAULT 1
+               )"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS channel_settings (
+                   channel_id   INTEGER PRIMARY KEY,
+                   auto_enabled INTEGER NOT NULL DEFAULT 1
                )"""
         )
         if seed_words:
@@ -77,8 +97,27 @@ def remove_term(term):
 
 
 def bump_hit(term):
+    """Record that a card fired for `term`: count it and stamp last_fired."""
     with _conn() as c:
-        c.execute("UPDATE terms SET hits = hits + 1 WHERE term = ?", (term.lower(),))
+        c.execute(
+            "UPDATE terms SET hits = hits + 1, last_fired = ? WHERE term = ?",
+            (_now(), term.lower()),
+        )
+
+
+def word_recently_fired(term, within_seconds):
+    """True if a card for `term` fired within the last `within_seconds`.
+
+    Drives the long per-word cooldown so an already-defined word doesn't keep
+    re-firing. Server-wide (keyed on the term, not the channel)."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT last_fired FROM terms WHERE term = ?", (term.lower(),)
+        ).fetchone()
+    if not row or not row["last_fired"]:
+        return False
+    last = datetime.fromisoformat(row["last_fired"])
+    return (datetime.now(timezone.utc) - last).total_seconds() < within_seconds
 
 
 def list_terms(limit=100):
@@ -117,3 +156,43 @@ def bump_candidate(term):
             (term, now, now),
         )
         return c.execute("SELECT count FROM candidates WHERE term = ?", (term,)).fetchone()[0]
+
+
+# ---- auto-translation on/off (per guild + per channel) --------------------
+
+def disabled_guilds():
+    """Set of guild ids where auto-translation is paused server-wide."""
+    with _conn() as c:
+        return {
+            r["guild_id"]
+            for r in c.execute("SELECT guild_id FROM guild_settings WHERE auto_enabled = 0")
+        }
+
+
+def disabled_channels():
+    """Set of channel ids where auto-translation is paused."""
+    with _conn() as c:
+        return {
+            r["channel_id"]
+            for r in c.execute("SELECT channel_id FROM channel_settings WHERE auto_enabled = 0")
+        }
+
+
+def set_guild_auto(guild_id, enabled):
+    """Turn auto-translation on/off for a whole guild (persisted)."""
+    with _conn() as c:
+        c.execute(
+            """INSERT INTO guild_settings(guild_id, auto_enabled) VALUES (?, ?)
+               ON CONFLICT(guild_id) DO UPDATE SET auto_enabled = excluded.auto_enabled""",
+            (guild_id, 1 if enabled else 0),
+        )
+
+
+def set_channel_auto(channel_id, enabled):
+    """Turn auto-translation on/off for a single channel (persisted)."""
+    with _conn() as c:
+        c.execute(
+            """INSERT INTO channel_settings(channel_id, auto_enabled) VALUES (?, ?)
+               ON CONFLICT(channel_id) DO UPDATE SET auto_enabled = excluded.auto_enabled""",
+            (channel_id, 1 if enabled else 0),
+        )

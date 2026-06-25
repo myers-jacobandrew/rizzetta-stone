@@ -24,12 +24,15 @@ GUILD_ID = os.environ.get("GUILD_ID")  # optional: instant slash-command sync
 
 # Tuning (all overridable via env)
 COOLDOWN = float(os.environ.get("SLANG_COOLDOWN", "20"))       # secs between cards / channel
+WORD_COOLDOWN = float(os.environ.get("WORD_COOLDOWN", str(5 * 24 * 3600)))  # per-word re-fire gap (default 5 days)
 LEARN_HITS = int(os.environ.get("LEARN_HITS", "3"))            # sightings before UD check
 LEARN_MIN_NET = int(os.environ.get("LEARN_MIN_NET", "150"))    # min UD net votes to learn
 LEARN_MIN_RATIO = float(os.environ.get("LEARN_MIN_RATIO", "0"))  # min up/(up+down); 0 = off
 
 _last_fire: dict[int, float] = {}
 KNOWN: set[str] = set()  # in-memory cache of active terms, kept in sync with DB
+AUTO_DISABLED: set[int] = set()           # guild ids where auto-cards are paused server-wide
+AUTO_DISABLED_CHANNELS: set[int] = set()  # channel ids where auto-cards are paused
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -43,6 +46,8 @@ class TranslatorBot(discord.Client):
     async def setup_hook(self):
         db.init_db(seed_words=SEED_WORDS)
         KNOWN.update(db.active_terms())
+        AUTO_DISABLED.update(db.disabled_guilds())
+        AUTO_DISABLED_CHANNELS.update(db.disabled_channels())
         if GUILD_ID:
             g = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=g)
@@ -95,14 +100,27 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.content:
         return
 
+    # Respect the /cards on/off switches — auto-detection is paused if either
+    # the whole server or this channel has it turned off. (/define etc. still
+    # work; those are slash commands and never reach here.)
+    if message.guild and message.guild.id in AUTO_DISABLED:
+        return
+    if message.channel.id in AUTO_DISABLED_CHANNELS:
+        return
+
     # 1) Known slang -> fire a definition card.
     term = find_slang(message.content, KNOWN)
     if term:
+        low = term.lower()
         if _on_cooldown(message.channel.id):
+            return
+        # Long per-word cooldown: don't re-define a word that already fired
+        # recently (default 5 days), so repeats don't spam the same card.
+        if db.word_recently_fired(low, WORD_COOLDOWN):
             return
         d = await define(term)
         if d:
-            db.bump_hit(term.lower())
+            db.bump_hit(low)
             _last_fire[message.channel.id] = time.monotonic()
             await message.reply(embed=_card(d), mention_author=False)
         return
@@ -122,6 +140,7 @@ async def on_message(message: discord.Message):
             db.add_term(tok.lower(), source="learned")
             KNOWN.add(tok.lower())
             if not _on_cooldown(message.channel.id):
+                db.bump_hit(tok.lower())  # start the per-word cooldown on the announce card
                 _last_fire[message.channel.id] = time.monotonic()
                 await message.channel.send(embed=_card(d, learned=True))
             return
@@ -202,6 +221,91 @@ async def slang_pending(interaction: discord.Interaction):
 
 
 bot.tree.add_command(slang_group)
+
+
+# ---- auto-card on/off switch ----------------------------------------------
+# Anyone can pause/resume auto-detection for a channel; flipping the WHOLE
+# server is mods-only so one person can't silence everyone. /define is
+# unaffected either way.
+
+cards_group = app_commands.Group(name="cards", description="Turn automatic slang cards on or off")
+
+_SCOPE_CHOICES = [
+    app_commands.Choice(name="this channel", value="channel"),
+    app_commands.Choice(name="whole server", value="server"),
+]
+
+
+def _apply_cards(guild_id, channel_id, scope, enabled):
+    """Persist + update the in-memory switch. Returns a human label for the scope."""
+    if scope == "server":
+        db.set_guild_auto(guild_id, enabled)
+        (AUTO_DISABLED.discard if enabled else AUTO_DISABLED.add)(guild_id)
+        return "the whole server"
+    db.set_channel_auto(channel_id, enabled)
+    (AUTO_DISABLED_CHANNELS.discard if enabled else AUTO_DISABLED_CHANNELS.add)(channel_id)
+    return "this channel"
+
+
+@cards_group.command(name="off", description="Pause automatic slang cards")
+@app_commands.describe(scope="this channel (default) or the whole server")
+@app_commands.choices(scope=_SCOPE_CHOICES)
+async def cards_off(interaction: discord.Interaction, scope: app_commands.Choice[str] = None):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Use this in a server channel.", ephemeral=True)
+        return
+    s = scope.value if scope else "channel"
+    if s == "server" and not _is_mod(interaction):
+        await interaction.response.send_message(
+            "Turning auto-cards off for the **whole server** is mods only. "
+            "You can still use `/cards off` for this channel.", ephemeral=True
+        )
+        return
+    where = _apply_cards(interaction.guild_id, interaction.channel_id, s, False)
+    await interaction.response.send_message(
+        f"🔇 Auto slang cards are now **off** for {where}. `/define` still works. "
+        f"Turn them back on with `/cards on{' scope:server' if s == 'server' else ''}`."
+    )
+
+
+@cards_group.command(name="on", description="Resume automatic slang cards")
+@app_commands.describe(scope="this channel (default) or the whole server")
+@app_commands.choices(scope=_SCOPE_CHOICES)
+async def cards_on(interaction: discord.Interaction, scope: app_commands.Choice[str] = None):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Use this in a server channel.", ephemeral=True)
+        return
+    s = scope.value if scope else "channel"
+    if s == "server" and not _is_mod(interaction):
+        await interaction.response.send_message(
+            "Turning auto-cards on for the **whole server** is mods only.", ephemeral=True
+        )
+        return
+    where = _apply_cards(interaction.guild_id, interaction.channel_id, s, True)
+    note = ""
+    # Channel-on has no effect while the whole server is still paused.
+    if s == "channel" and interaction.guild_id in AUTO_DISABLED:
+        note = " Note: auto-cards are still paused **server-wide** — a mod needs `/cards on scope:server`."
+    await interaction.response.send_message(f"🔊 Auto slang cards are now **on** for {where}.{note}")
+
+
+@cards_group.command(name="status", description="Show whether auto slang cards are on here")
+async def cards_status(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Use this in a server channel.", ephemeral=True)
+        return
+    server_off = interaction.guild_id in AUTO_DISABLED
+    channel_off = interaction.channel_id in AUTO_DISABLED_CHANNELS
+    if server_off:
+        state = "🔇 **off** (paused server-wide)"
+    elif channel_off:
+        state = "🔇 **off** in this channel"
+    else:
+        state = "🔊 **on**"
+    await interaction.response.send_message(f"Auto slang cards here: {state}", ephemeral=True)
+
+
+bot.tree.add_command(cards_group)
 
 
 if __name__ == "__main__":
